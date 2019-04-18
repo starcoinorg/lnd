@@ -34,7 +34,12 @@ service Invoices {
     SettleInvoice settles an accepted invoice. If the invoice is already
     settled, this call will succeed.
     */
-    rpc SettleInvoice(SettleInvoiceMsg) returns (SettleInvoiceResp);
+    rpc SettleInvoice(SettleInvoiceMsg) returns (SettleInvoiceResp){
+        option (google.api.http) = {
+                post: "/v1/invoice/settle"
+                body: "*"
+        };
+    }
 }
 
 message CancelInvoiceMsg {
@@ -95,7 +100,7 @@ message AddHoldInvoiceResp {
 
 message SettleInvoiceMsg {
     /// Externally discovered pre-image that should be used to settle the hold invoice.
-    bytes preimage = 1;
+    bytes preimage = 1 [json_name = "preimage"];;
 } 
 
 message SettleInvoiceResp {}
