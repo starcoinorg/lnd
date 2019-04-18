@@ -345,7 +345,6 @@ func lndMain() error {
 
 	// Initialize, and register our implementation of the gRPC interface
 	// exported by the rpcServer.
-	ltndLog.Info(proxyOpts)
 	rpcServer, err := newRPCServer(
 		server, macaroonService, cfg.SubRPCServers, serverOpts,
 		restDialOpts, restProxyDest, atplManager, server.invoices,
