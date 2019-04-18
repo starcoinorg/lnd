@@ -1513,10 +1513,10 @@ func (c *ChannelGraph) NodeUpdatesInHorizon(startTime, endTime time.Time) ([]Lig
 }
 
 // FilterKnownChanIDs takes a set of channel IDs and return the subset of chan
-// ID's that we don't know of in the passed set. In other words, we perform a
-// set difference of our set of chan ID's and the ones passed in. This method
-// can be used by callers to determine the set of channels ta peer knows of
-// that we don't.
+// ID's that we don't know and are not known zombies of the passed set. In other
+// words, we perform a set difference of our set of chan ID's and the ones
+// passed in. This method can be used by callers to determine the set of
+// channels another peer knows of that we don't.
 func (c *ChannelGraph) FilterKnownChanIDs(chanIDs []uint64) ([]uint64, error) {
 	var newChanIDs []uint64
 
@@ -1530,15 +1530,31 @@ func (c *ChannelGraph) FilterKnownChanIDs(chanIDs []uint64) ([]uint64, error) {
 			return ErrGraphNoEdgesFound
 		}
 
+		// Fetch the zombie index, it may not exist if no edges have
+		// ever been marked as zombies. If the index has been
+		// initialized, we will use it later to skip known zombie edges.
+		zombieIndex := edges.Bucket(zombieBucket)
+
 		// We'll run through the set of chanIDs and collate only the
 		// set of channel that are unable to be found within our db.
 		var cidBytes [8]byte
 		for _, cid := range chanIDs {
 			byteOrder.PutUint64(cidBytes[:], cid)
 
-			if v := edgeIndex.Get(cidBytes[:]); v == nil {
-				newChanIDs = append(newChanIDs, cid)
+			// If the edge is already known, skip it.
+			if v := edgeIndex.Get(cidBytes[:]); v != nil {
+				continue
 			}
+
+			// If the edge is a known zombie, skip it.
+			if zombieIndex != nil {
+				isZombie, _, _ := isZombieEdge(zombieIndex, cid)
+				if isZombie {
+					continue
+				}
+			}
+
+			newChanIDs = append(newChanIDs, cid)
 		}
 
 		return nil
@@ -1620,9 +1636,11 @@ func (c *ChannelGraph) FilterChannelRange(startHeight, endHeight uint32) ([]uint
 	return chanIDs, nil
 }
 
-// FetchChanInfos returns the set of channel edges that correspond to the
-// passed channel ID's. This can be used to respond to peer queries that are
-// seeking to fill in gaps in their view of the channel graph.
+// FetchChanInfos returns the set of channel edges that correspond to the passed
+// channel ID's. If an edge is the query is unknown to the database, it will
+// skipped and the result will contain only those edges that exist at the time
+// of the query. This can be used to respond to peer queries that are seeking to
+// fill in gaps in their view of the channel graph.
 func (c *ChannelGraph) FetchChanInfos(chanIDs []uint64) ([]ChannelEdge, error) {
 	// TODO(roasbeef): sort cids?
 
@@ -1648,11 +1666,16 @@ func (c *ChannelGraph) FetchChanInfos(chanIDs []uint64) ([]ChannelEdge, error) {
 		for _, cid := range chanIDs {
 			byteOrder.PutUint64(cidBytes[:], cid)
 
-			// First, we'll fetch the static edge information.
+			// First, we'll fetch the static edge information. If
+			// the edge is unknown, we will skip the edge and
+			// continue gathering all known edges.
 			edgeInfo, err := fetchChanEdgeInfo(
 				edgeIndex, cidBytes[:],
 			)
-			if err != nil {
+			switch {
+			case err == ErrEdgeNotFound:
+				continue
+			case err != nil:
 				return err
 			}
 			edgeInfo.db = c.db
@@ -3040,36 +3063,6 @@ func (c *ChannelGraph) ChannelView() ([]EdgePoint, error) {
 // NewChannelEdgePolicy returns a new blank ChannelEdgePolicy.
 func (c *ChannelGraph) NewChannelEdgePolicy() *ChannelEdgePolicy {
 	return &ChannelEdgePolicy{db: c.db}
-}
-
-// MarkEdgeZombie marks an edge as a zombie within the graph's zombie index.
-// The public keys should represent the node public keys of the two parties
-// involved in the edge.
-func (c *ChannelGraph) MarkEdgeZombie(chanID uint64, pubKey1,
-	pubKey2 [33]byte) error {
-
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
-
-	err := c.db.Update(func(tx *bbolt.Tx) error {
-		edges := tx.Bucket(edgeBucket)
-		if edges == nil {
-			return ErrGraphNoEdgesFound
-		}
-		zombieIndex, err := edges.CreateBucketIfNotExists(zombieBucket)
-		if err != nil {
-			return err
-		}
-		return markEdgeZombie(zombieIndex, chanID, pubKey1, pubKey2)
-	})
-	if err != nil {
-		return err
-	}
-
-	c.rejectCache.remove(chanID)
-	c.chanCache.remove(chanID)
-
-	return nil
 }
 
 // markEdgeZombie marks an edge as a zombie within our zombie index. The public

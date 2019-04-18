@@ -838,7 +838,7 @@ var closeChannelCommand = cli.Command{
 	To view which funding_txids/output_indexes can be used for a channel close,
 	see the channel_point values within the listchannels command output.
 	The format for a channel_point is 'funding_txid:output_index'.`,
-	ArgsUsage: "funding_txid [output_index [time_limit]]",
+	ArgsUsage: "funding_txid [output_index]",
 	Flags: []cli.Flag{
 		cli.StringFlag{
 			Name:  "funding_txid",
@@ -849,15 +849,9 @@ var closeChannelCommand = cli.Command{
 			Usage: "the output index for the funding output of the funding " +
 				"transaction",
 		},
-		cli.StringFlag{
-			Name: "time_limit",
-			Usage: "a relative deadline afterwhich the attempt should be " +
-				"abandoned",
-		},
 		cli.BoolFlag{
-			Name: "force",
-			Usage: "after the time limit has passed, attempt an " +
-				"uncooperative closure",
+			Name:  "force",
+			Usage: "attempt an uncooperative closure",
 		},
 		cli.BoolFlag{
 			Name:  "block",
@@ -3625,8 +3619,8 @@ var exportChanBackupCommand = cli.Command{
 	ArgsUsage: "[chan_point] [--all] [--output_file]",
 	Description: `
 	This command allows a user to export a Static Channel Backup (SCB) for
-	as selected channel. SCB's are encrypted backups of a channel's initial
-	state that are encrypted with a key derived from the seed of a user.In
+	a selected channel. SCB's are encrypted backups of a channel's initial
+	state that are encrypted with a key derived from the seed of a user. In
 	the case of partial or complete data loss, the SCB will allow the user
 	to reclaim settled funds in the channel at its final state. The
 	exported channel backups can be restored at a later time using the
@@ -3643,7 +3637,7 @@ var exportChanBackupCommand = cli.Command{
 	     returned. A multi backup is a single encrypted blob (displayed in
 	     hex encoding) that contains several channels in a single cipher
 	     text.
-	
+
 	Both of the backup types can be restored using the restorechanbackup
 	command.
 	`,
@@ -3789,11 +3783,11 @@ var verifyChanBackupCommand = cli.Command{
 	Name:      "verifychanbackup",
 	Category:  "Channels",
 	Usage:     "Verify an existing channel backup",
-	ArgsUsage: "[--single_backup] [--multi_backup] [--multi_file=]",
+	ArgsUsage: "[--single_backup] [--multi_backup] [--multi_file]",
 	Description: `
     This command allows a user to verify an existing Single or Multi channel
     backup for integrity. This is useful when a user has a backup, but is
-    unsure as to if it's valid or for the target node. 
+    unsure as to if it's valid or for the target node.
 
     The command will accept backups in one of three forms:
 

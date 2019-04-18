@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"image/color"
 	"math/big"
+	prand "math/rand"
 	"net"
 	"path/filepath"
 	"regexp"
@@ -60,6 +61,18 @@ const (
 	// durations exceeding this value will be eligible to have their
 	// backoffs reduced.
 	defaultStableConnDuration = 10 * time.Minute
+
+	// numInstantInitReconnect specifies how many persistent peers we should
+	// always attempt outbound connections to immediately. After this value
+	// is surpassed, the remaining peers will be randomly delayed using
+	// maxInitReconnectDelay.
+	numInstantInitReconnect = 10
+
+	// maxInitReconnectDelay specifies the maximum delay in seconds we will
+	// apply in attempting to reconnect to persistent peers on startup. The
+	// value used or a particular peer will be chosen between 0s and this
+	// value.
+	maxInitReconnectDelay = 30
 )
 
 var (
@@ -75,6 +88,19 @@ var (
 	// color string matches the standard hex color format #RRGGBB.
 	validColorRegexp = regexp.MustCompile("^#[A-Fa-f0-9]{6}$")
 )
+
+// errPeerAlreadyConnected is an error returned by the server when we're
+// commanded to connect to a peer, but they're already connected.
+type errPeerAlreadyConnected struct {
+	peer *peer
+}
+
+// Error returns the human readable version of this error type.
+//
+// NOTE: Part of the error interface.
+func (e *errPeerAlreadyConnected) Error() string {
+	return fmt.Sprintf("already connected to peer: %v", e.peer)
+}
 
 // server is the main server of the Lightning Network Daemon. The server houses
 // global state pertaining to the wallet, database, and the rpcserver.
@@ -636,10 +662,7 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 		return nil, fmt.Errorf("can't create router: %v", err)
 	}
 
-	chanSeries := discovery.NewChanSeries(
-		s.chanDB.ChannelGraph(),
-	)
-
+	chanSeries := discovery.NewChanSeries(s.chanDB.ChannelGraph())
 	gossipMessageStore, err := discovery.NewMessageStore(s.chanDB)
 	if err != nil {
 		return nil, err
@@ -650,19 +673,23 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 	}
 
 	s.authGossiper = discovery.New(discovery.Config{
-		Router:            s.chanRouter,
-		Notifier:          s.cc.chainNotifier,
-		ChainHash:         *activeNetParams.GenesisHash,
-		Broadcast:         s.BroadcastMessage,
-		ChanSeries:        chanSeries,
-		NotifyWhenOnline:  s.NotifyWhenOnline,
-		NotifyWhenOffline: s.NotifyWhenOffline,
-		ProofMatureDelta:  0,
-		TrickleDelay:      time.Millisecond * time.Duration(cfg.TrickleDelay),
-		RetransmitDelay:   time.Minute * 30,
-		WaitingProofStore: waitingProofStore,
-		MessageStore:      gossipMessageStore,
-		AnnSigner:         s.nodeSigner,
+		Router:                    s.chanRouter,
+		Notifier:                  s.cc.chainNotifier,
+		ChainHash:                 *activeNetParams.GenesisHash,
+		Broadcast:                 s.BroadcastMessage,
+		ChanSeries:                chanSeries,
+		NotifyWhenOnline:          s.NotifyWhenOnline,
+		NotifyWhenOffline:         s.NotifyWhenOffline,
+		ProofMatureDelta:          0,
+		TrickleDelay:              time.Millisecond * time.Duration(cfg.TrickleDelay),
+		RetransmitDelay:           time.Minute * 30,
+		WaitingProofStore:         waitingProofStore,
+		MessageStore:              gossipMessageStore,
+		AnnSigner:                 s.nodeSigner,
+		RotateTicker:              ticker.New(discovery.DefaultSyncerRotationInterval),
+		HistoricalSyncTicker:      ticker.New(cfg.HistoricalSyncInterval),
+		ActiveSyncerTimeoutTicker: ticker.New(discovery.DefaultActiveSyncerTimeout),
+		NumActiveSyncers:          cfg.NumGraphSyncPeers,
 	},
 		s.identityPriv.PubKey(),
 	)
@@ -727,8 +754,9 @@ func newServer(listenAddrs []net.Addr, chanDB *channeldb.DB, cc *chainControl,
 	contractBreaches := make(chan *ContractBreachEvent, 1)
 
 	s.chainArb = contractcourt.NewChainArbitrator(contractcourt.ChainArbitratorConfig{
-		ChainHash:      *activeNetParams.GenesisHash,
-		BroadcastDelta: defaultBroadcastDelta,
+		ChainHash:              *activeNetParams.GenesisHash,
+		IncomingBroadcastDelta: defaultIncomingBroadcastDelta,
+		OutgoingBroadcastDelta: defaultOutgoingBroadcastDelta,
 		NewSweepAddr: func() ([]byte, error) {
 			return newSweepPkScript(cc.wallet)
 		},
@@ -1930,6 +1958,7 @@ func (s *server) establishPersistentConnections() error {
 
 	// Iterate through the combined list of addresses from prior links and
 	// node announcements and attempt to reconnect to each node.
+	var numOutboundConns int
 	for pubStr, nodeAddr := range nodeAddrsMap {
 		// Add this peer to the set of peers we should maintain a
 		// persistent connection with.
@@ -1960,11 +1989,40 @@ func (s *server) establishPersistentConnections() error {
 			s.persistentConnReqs[pubStr] = append(
 				s.persistentConnReqs[pubStr], connReq)
 
-			go s.connMgr.Connect(connReq)
+			// We'll connect to the first 10 peers immediately, then
+			// randomly stagger any remaining connections if the
+			// stagger initial reconnect flag is set. This ensures
+			// that mobile nodes or nodes with a small number of
+			// channels obtain connectivity quickly, but larger
+			// nodes are able to disperse the costs of connecting to
+			// all peers at once.
+			if numOutboundConns < numInstantInitReconnect ||
+				!cfg.StaggerInitialReconnect {
+
+				go s.connMgr.Connect(connReq)
+			} else {
+				go s.delayInitialReconnect(connReq)
+			}
 		}
+
+		numOutboundConns++
 	}
 
 	return nil
+}
+
+// delayInitialReconnect will attempt a reconnection using the passed connreq
+// after sampling a value for the delay between 0s and the
+// maxInitReconnectDelay.
+//
+// NOTE: This method MUST be run as a goroutine.
+func (s *server) delayInitialReconnect(connReq *connmgr.ConnReq) {
+	delay := time.Duration(prand.Intn(maxInitReconnectDelay)) * time.Second
+	select {
+	case <-time.After(delay):
+		s.connMgr.Connect(connReq)
+	case <-s.quit:
+	}
 }
 
 // prunePersistentPeerConnection removes all internal state related to
@@ -2474,14 +2532,16 @@ func (s *server) peerConnected(conn net.Conn, connReq *connmgr.ConnReq,
 	localFeatures.Set(lnwire.GossipQueriesOptional)
 
 	// Now that we've established a connection, create a peer, and it to the
-	// set of currently active peers. Configure the peer with a expiry grace
-	// delta greater than the broadcast delta, to prevent links from
-	// accepting htlcs that may trigger channel arbitrator force close the
-	// channel immediately.
+	// set of currently active peers. Configure the peer with the incoming
+	// and outgoing broadcast deltas to prevent htlcs from being accepted or
+	// offered that would trigger channel closure. In case of outgoing
+	// htlcs, an extra block is added to prevent the channel from being
+	// closed when the htlc is outstanding and a new block comes in.
 	p, err := newPeer(
 		conn, connReq, s, peerAddr, inbound, localFeatures,
 		cfg.ChanEnableTimeout,
-		defaultBroadcastDelta+extraExpiryGraceDelta,
+		defaultFinalCltvRejectDelta,
+		defaultOutgoingCltvRejectDelta,
 	)
 	if err != nil {
 		srvrLog.Errorf("unable to create peer %v", err)
@@ -2622,7 +2682,7 @@ func (s *server) peerTerminationWatcher(p *peer, ready chan struct{}) {
 
 	// We'll also inform the gossiper that this peer is no longer active,
 	// so we don't need to maintain sync state for it any longer.
-	s.authGossiper.PruneSyncState(pubKey)
+	s.authGossiper.PruneSyncState(p.PubKey())
 
 	// Tell the switch to remove all links associated with this peer.
 	// Passing nil as the target link indicates that all links associated
@@ -2828,7 +2888,7 @@ func (s *server) ConnectToPeer(addr *lnwire.NetAddress, perm bool) error {
 	peer, err := s.findPeerByPubStr(targetPub)
 	if err == nil {
 		s.mu.Unlock()
-		return fmt.Errorf("already connected to peer: %v", peer)
+		return &errPeerAlreadyConnected{peer: peer}
 	}
 
 	// Peer was not found, continue to pursue connection with peer.

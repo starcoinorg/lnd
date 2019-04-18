@@ -24,6 +24,7 @@ import (
 	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch/hodl"
 	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc/signrpc"
@@ -67,7 +68,11 @@ const (
 	defaultTorV2PrivateKeyFilename = "v2_onion_private_key"
 	defaultTorV3PrivateKeyFilename = "v3_onion_private_key"
 
-	defaultBroadcastDelta = 10
+	defaultIncomingBroadcastDelta = 20
+	defaultFinalCltvRejectDelta   = 2
+
+	defaultOutgoingBroadcastDelta  = 10
+	defaultOutgoingCltvRejectDelta = 0
 
 	// minTimeLockDelta is the minimum timelock we require for incoming
 	// HTLCs on our channels.
@@ -125,6 +130,7 @@ type neutrinoConfig struct {
 	MaxPeers     int           `long:"maxpeers" description:"Max number of inbound and outbound peers"`
 	BanDuration  time.Duration `long:"banduration" description:"How long to ban misbehaving peers.  Valid time units are {s, m, h}.  Minimum 1 second"`
 	BanThreshold uint32        `long:"banthreshold" description:"Maximum allowed ban score before disconnecting and banning misbehaving peers."`
+	FeeURL       string        `long:"feeurl" description:"Optional URL for fee estimation. If a URL is not specified, static fees will be used for estimation."`
 }
 
 type btcdConfig struct {
@@ -248,9 +254,12 @@ type config struct {
 	Color       string `long:"color" description:"The color of the node in hex format (i.e. '#3399FF'). Used to customize node appearance in intelligence services"`
 	MinChanSize int64  `long:"minchansize" description:"The smallest channel size (in satoshis) that we should accept. Incoming channels smaller than this will be rejected"`
 
-	NoChanUpdates bool `long:"nochanupdates" description:"If specified, lnd will not request real-time channel updates from connected peers. This option should be used by routing nodes to save bandwidth."`
+	NumGraphSyncPeers      int           `long:"numgraphsyncpeers" description:"The number of peers that we should receive new graph updates from. This option can be tuned to save bandwidth for light clients or routing nodes."`
+	HistoricalSyncInterval time.Duration `long:"historicalsyncinterval" description:"The polling interval between historical graph sync attempts. Each historical graph sync attempt ensures we reconcile with the remote peer's graph from the genesis block."`
 
 	RejectPush bool `long:"rejectpush" description:"If true, lnd will not accept channel opening requests with non-zero push amounts. This should prevent accidental pushes to merchant nodes."`
+
+	StaggerInitialReconnect bool `long:"stagger-initial-reconnect" description:"If true, will apply a randomized staggering between 0s and 30s when reconnecting to persistent peers on startup. The first 10 reconnections will be attempted instantly, regardless of the flag's value"`
 
 	net tor.Net
 
@@ -335,6 +344,8 @@ func loadConfig() (*config, error) {
 		Alias:                    defaultAlias,
 		Color:                    defaultColor,
 		MinChanSize:              int64(minChanFundingSize),
+		NumGraphSyncPeers:        defaultMinPeers,
+		HistoricalSyncInterval:   discovery.DefaultHistoricalSyncInterval,
 		Tor: &torConfig{
 			SOCKS:   defaultTorSOCKS,
 			DNS:     defaultTorDNS,

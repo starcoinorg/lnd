@@ -9008,7 +9008,7 @@ func testBidirectionalAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) 
 
 	// Open up a payment streams to Alice and to Bob, that we'll use to
 	// send payment between nodes.
-	ctx, cancel := context.WithCancel(ctxb)
+	ctx, cancel := context.WithTimeout(ctxb, lntest.AsyncBenchmarkTimeout)
 	defer cancel()
 
 	alicePayStream, err := net.Alice.SendPayment(ctx)
@@ -9016,7 +9016,7 @@ func testBidirectionalAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) 
 		t.Fatalf("unable to create payment stream for alice: %v", err)
 	}
 
-	ctx, cancel = context.WithCancel(ctxb)
+	ctx, cancel = context.WithTimeout(ctxb, lntest.AsyncBenchmarkTimeout)
 	defer cancel()
 
 	bobPayStream, err := net.Bob.SendPayment(ctx)
@@ -9081,16 +9081,15 @@ func testBidirectionalAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) 
 
 	// Wait for Alice and Bob receive their payments, and throw and error
 	// if something goes wrong.
-	maxTime := 60 * time.Second
 	for i := 0; i < 2; i++ {
 		select {
 		case err := <-errChan:
 			if err != nil {
 				t.Fatalf(err.Error())
 			}
-		case <-time.After(maxTime):
+		case <-time.After(lntest.AsyncBenchmarkTimeout):
 			t.Fatalf("waiting for payments to finish too long "+
-				"(%v)", maxTime)
+				"(%v)", lntest.AsyncBenchmarkTimeout)
 		}
 	}
 
@@ -9420,7 +9419,7 @@ func testMultiHopHtlcLocalTimeout(net *lntest.NetworkHarness, t *harnessTest) {
 	// We'll now mine enough blocks to trigger Bob's broadcast of his
 	// commitment transaction due to the fact that the HTLC is about to
 	// timeout.
-	numBlocks := uint32(finalCltvDelta - defaultBroadcastDelta)
+	numBlocks := uint32(finalCltvDelta - defaultOutgoingBroadcastDelta)
 	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks: %v", err)
 	}
@@ -9469,7 +9468,10 @@ func testMultiHopHtlcLocalTimeout(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// We'll now mine the remaining blocks to cause the HTLC itself to
 	// timeout.
-	if _, err := net.Miner.Node.Generate(defaultBroadcastDelta - defaultCSV); err != nil {
+	_, err = net.Miner.Node.Generate(
+		defaultOutgoingBroadcastDelta - defaultCSV,
+	)
+	if err != nil {
 		t.Fatalf("unable to generate blocks: %v", err)
 	}
 
@@ -9600,7 +9602,7 @@ func testMultiHopReceiverChainClaim(net *lntest.NetworkHarness, t *harnessTest) 
 	const invoiceAmt = 100000
 	invoiceReq := &lnrpc.Invoice{
 		Value:      invoiceAmt,
-		CltvExpiry: 20,
+		CltvExpiry: 40,
 	}
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
 	carolInvoice, err := carol.AddInvoice(ctxt, invoiceReq)
@@ -9644,7 +9646,9 @@ func testMultiHopReceiverChainClaim(net *lntest.NetworkHarness, t *harnessTest) 
 	// Now we'll mine enough blocks to prompt carol to actually go to the
 	// chain in order to sweep her HTLC since the value is high enough.
 	// TODO(roasbeef): modify once go to chain policy changes
-	numBlocks := uint32(invoiceReq.CltvExpiry - defaultBroadcastDelta)
+	numBlocks := uint32(
+		invoiceReq.CltvExpiry - defaultIncomingBroadcastDelta,
+	)
 	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks")
 	}
@@ -10324,7 +10328,7 @@ func testMultiHopHtlcLocalChainClaim(net *lntest.NetworkHarness, t *harnessTest)
 	// With the network active, we'll now add a new invoice at Carol's end.
 	invoiceReq := &lnrpc.Invoice{
 		Value:      100000,
-		CltvExpiry: 20,
+		CltvExpiry: 40,
 	}
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
 	carolInvoice, err := carol.AddInvoice(ctxt, invoiceReq)
@@ -10380,7 +10384,9 @@ func testMultiHopHtlcLocalChainClaim(net *lntest.NetworkHarness, t *harnessTest)
 
 	// We'll now mine enough blocks so Carol decides that she needs to go
 	// on-chain to claim the HTLC as Bob has been inactive.
-	numBlocks := uint32(20 - defaultBroadcastDelta)
+	numBlocks := uint32(invoiceReq.CltvExpiry -
+		defaultIncomingBroadcastDelta)
+
 	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks")
 	}
@@ -10661,7 +10667,7 @@ func testMultiHopHtlcRemoteChainClaim(net *lntest.NetworkHarness, t *harnessTest
 	const invoiceAmt = 100000
 	invoiceReq := &lnrpc.Invoice{
 		Value:      invoiceAmt,
-		CltvExpiry: 20,
+		CltvExpiry: 40,
 	}
 	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
 	carolInvoice, err := carol.AddInvoice(ctxt, invoiceReq)
@@ -10731,7 +10737,9 @@ func testMultiHopHtlcRemoteChainClaim(net *lntest.NetworkHarness, t *harnessTest
 
 	// We'll now mine enough blocks so Carol decides that she needs to go
 	// on-chain to claim the HTLC as Bob has been inactive.
-	numBlocks := uint32(20-defaultBroadcastDelta) - defaultCSV
+	numBlocks := uint32(invoiceReq.CltvExpiry-
+		defaultIncomingBroadcastDelta) - defaultCSV
+
 	if _, err := net.Miner.Node.Generate(numBlocks); err != nil {
 		t.Fatalf("unable to generate blocks")
 	}
@@ -13250,15 +13258,10 @@ func testChannelBackupUpdates(net *lntest.NetworkHarness, t *harnessTest) {
 						MultiChanBackup: backup,
 					},
 				}
-				resp, err := carol.VerifyChanBackup(ctxb, snapshot)
+				_, err := carol.VerifyChanBackup(ctxb, snapshot)
 				if err != nil {
 					return fmt.Errorf("unable to verify "+
-						"back up: %v", err)
-				}
-
-				if !resp.SinglesValid || !resp.MultiValid {
-					return fmt.Errorf("backup #%v is "+
-						"invalid", i)
+						"backup #%d: %v", i, err)
 				}
 			}
 
@@ -13374,21 +13377,32 @@ func testExportChannelBackup(net *lntest.NetworkHarness, t *harnessTest) {
 	// Before we proceed, we'll make two utility methods we'll use below
 	// for our primary assertions.
 	assertNumSingleBackups := func(numSingles int) {
-		ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
-		req := &lnrpc.ChanBackupExportRequest{}
-		chanSnapshot, err := carol.ExportAllChannelBackups(ctxt, req)
+		err := lntest.WaitNoError(func() error {
+			ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
+			req := &lnrpc.ChanBackupExportRequest{}
+			chanSnapshot, err := carol.ExportAllChannelBackups(
+				ctxt, req,
+			)
+			if err != nil {
+				return fmt.Errorf("unable to export channel "+
+					"backup: %v", err)
+			}
+
+			if chanSnapshot.SingleChanBackups == nil {
+				return fmt.Errorf("single chan backups not " +
+					"populated")
+			}
+
+			backups := chanSnapshot.SingleChanBackups.ChanBackups
+			if len(backups) != numSingles {
+				return fmt.Errorf("expected %v singles, "+
+					"got %v", len(backups), numSingles)
+			}
+
+			return nil
+		}, defaultTimeout)
 		if err != nil {
-			t.Fatalf("unable to export channel backup: %v", err)
-		}
-
-		if chanSnapshot.SingleChanBackups == nil {
-			t.Fatalf("single chan backups not populated")
-		}
-
-		backups := chanSnapshot.SingleChanBackups.ChanBackups
-		if len(backups) != numSingles {
-			t.Fatalf("expected %v singles, got %v", len(backups),
-				numSingles)
+			t.Fatalf(err.Error())
 		}
 	}
 	assertMultiBackupFound := func() func(bool, map[wire.OutPoint]struct{}) {
@@ -13847,8 +13861,9 @@ func testChannelBackupRestore(net *lntest.NetworkHarness, t *harnessTest) {
 	// ann is updated?
 
 	for _, testCase := range testCases {
-		success := t.t.Run(testCase.name, func(_ *testing.T) {
-			testChanRestoreScenario(t, net, &testCase, password)
+		success := t.t.Run(testCase.name, func(t *testing.T) {
+			h := newHarnessTest(t)
+			testChanRestoreScenario(h, net, &testCase, password)
 		})
 		if !success {
 			break

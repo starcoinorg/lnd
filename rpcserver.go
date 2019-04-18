@@ -34,6 +34,7 @@ import (
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/channelnotifier"
+	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/invoices"
@@ -408,9 +409,12 @@ type rpcServer struct {
 	// server.
 	listenerCleanUp []func()
 
-	// restServerOpts are a set of gRPC dial options that the REST server
+	// restDialOpts are a set of gRPC dial options that the REST server
 	// proxy will use to connect to the main gRPC server.
-	restServerOpts []grpc.DialOption
+	restDialOpts []grpc.DialOption
+
+	// restProxyDest is the address to forward REST requests to.
+	restProxyDest string
 
 	// tlsCfg is the TLS config that allows the REST server proxy to
 	// connect to the main gRPC server to proxy all incoming requests.
@@ -434,8 +438,8 @@ var _ lnrpc.LightningServer = (*rpcServer)(nil)
 // like requiring TLS, etc.
 func newRPCServer(s *server, macService *macaroons.Service,
 	subServerCgs *subRPCServerConfigs, serverOpts []grpc.ServerOption,
-	restServerOpts []grpc.DialOption, atpl *autopilot.Manager,
-	invoiceRegistry *invoices.InvoiceRegistry,
+	restDialOpts []grpc.DialOption, restProxyDest string,
+	atpl *autopilot.Manager, invoiceRegistry *invoices.InvoiceRegistry,
 	tlsCfg *tls.Config) (*rpcServer, error) {
 
 	// Set up router rpc backend.
@@ -530,13 +534,14 @@ func newRPCServer(s *server, macService *macaroons.Service,
 	// gRPC server, and register the main lnrpc server along side.
 	grpcServer := grpc.NewServer(serverOpts...)
 	rootRPCServer := &rpcServer{
-		restServerOpts: restServerOpts,
-		subServers:     subServers,
-		tlsCfg:         tlsCfg,
-		grpcServer:     grpcServer,
-		server:         s,
-		routerBackend:  routerBackend,
-		quit:           make(chan struct{}, 1),
+		restDialOpts:  restDialOpts,
+		restProxyDest: restProxyDest,
+		subServers:    subServers,
+		tlsCfg:        tlsCfg,
+		grpcServer:    grpcServer,
+		server:        s,
+		routerBackend: routerBackend,
+		quit:          make(chan struct{}, 1),
 	}
 	lnrpc.RegisterLightningServer(grpcServer, rootRPCServer)
 
@@ -603,17 +608,10 @@ func (r *rpcServer) Start() error {
 	// TODO(roasbeef): eventually also allow the sub-servers to themselves
 	// have a REST proxy.
 	mux := proxy.NewServeMux()
-	grpcEndpoint := cfg.RPCListeners[0].String()
-	switch {
-	case strings.Contains(grpcEndpoint, "0.0.0.0"):
-		grpcEndpoint = strings.Replace(
-			grpcEndpoint, "0.0.0.0", "127.0.0.1", 1,
-		)
-	case strings.Contains(grpcEndpoint, "[::]"):
-		grpcEndpoint = strings.Replace(grpcEndpoint, "[::]", "[::1]", 1)
-	}
+
 	err := lnrpc.RegisterLightningHandlerFromEndpoint(
-		context.Background(), mux, grpcEndpoint, r.restServerOpts,
+		context.Background(), mux, r.restProxyDest,
+		r.restDialOpts,
 	)
 	if err != nil {
 		return err
@@ -1108,7 +1106,7 @@ func (r *rpcServer) NewAddress(ctx context.Context,
 		}
 	}
 
-	rpcsLog.Infof("[newaddress] addr=%v", addr.String())
+	rpcsLog.Debugf("[newaddress] type=%v addr=%v", in.Type, addr.String())
 	return &lnrpc.NewAddressResponse{Address: addr.String()}, nil
 }
 
@@ -2036,9 +2034,36 @@ func (r *rpcServer) ListPeers(ctx context.Context,
 			satRecv += int64(c.TotalMSatReceived.ToSatoshis())
 		}
 
-		nodePub := serverPeer.addr.IdentityKey.SerializeCompressed()
+		nodePub := serverPeer.PubKey()
+
+		// Retrieve the peer's sync type. If we don't currently have a
+		// syncer for the peer, then we'll default to a passive sync.
+		// This can happen if the RPC is called while a peer is
+		// initializing.
+		syncer, ok := r.server.authGossiper.SyncManager().GossipSyncer(
+			nodePub,
+		)
+
+		var lnrpcSyncType lnrpc.Peer_SyncType
+		if !ok {
+			rpcsLog.Warnf("Gossip syncer for peer=%x not found",
+				nodePub)
+			lnrpcSyncType = lnrpc.Peer_UNKNOWN_SYNC
+		} else {
+			syncType := syncer.SyncType()
+			switch syncType {
+			case discovery.ActiveSync:
+				lnrpcSyncType = lnrpc.Peer_ACTIVE_SYNC
+			case discovery.PassiveSync:
+				lnrpcSyncType = lnrpc.Peer_PASSIVE_SYNC
+			default:
+				return nil, fmt.Errorf("unhandled sync type %v",
+					syncType)
+			}
+		}
+
 		peer := &lnrpc.Peer{
-			PubKey:    hex.EncodeToString(nodePub),
+			PubKey:    hex.EncodeToString(nodePub[:]),
 			Address:   serverPeer.conn.RemoteAddr().String(),
 			Inbound:   serverPeer.inbound,
 			BytesRecv: atomic.LoadUint64(&serverPeer.bytesReceived),
@@ -2046,6 +2071,7 @@ func (r *rpcServer) ListPeers(ctx context.Context,
 			SatSent:   satSent,
 			SatRecv:   satRecv,
 			PingTime:  serverPeer.PingTime(),
+			SyncType:  lnrpcSyncType,
 		}
 
 		resp.Peers = append(resp.Peers, peer)
@@ -4766,63 +4792,64 @@ func (r *rpcServer) ExportChannelBackup(ctx context.Context,
 	}, nil
 }
 
-// VerifyChanBackup allows a caller to verify the integrity of a channel
-// backup snapshot. This method will accept both a packed Single, and also a
-// Packed multi. Two bools are returned which indicate if the passed Single
-// (if present) is valid and also if the passed Multi (if present) is valid.
+// VerifyChanBackup allows a caller to verify the integrity of a channel backup
+// snapshot. This method will accept both either a packed Single or a packed
+// Multi. Specifying both will result in an error.
 func (r *rpcServer) VerifyChanBackup(ctx context.Context,
 	in *lnrpc.ChanBackupSnapshot) (*lnrpc.VerifyChanBackupResponse, error) {
 
-	// If neither a Single or Multi has been specified, then we have
-	// nothing to verify.
-	if in.GetSingleChanBackups() == nil && in.GetMultiChanBackup() == nil {
-		return nil, fmt.Errorf("either a Single or Multi channel " +
+	switch {
+	// If neither a Single or Multi has been specified, then we have nothing
+	// to verify.
+	case in.GetSingleChanBackups() == nil && in.GetMultiChanBackup() == nil:
+		return nil, errors.New("either a Single or Multi channel " +
 			"backup must be specified")
-	}
+
+	// Either a Single or a Multi must be specified, but not both.
+	case in.GetSingleChanBackups() != nil && in.GetMultiChanBackup() != nil:
+		return nil, errors.New("either a Single or Multi channel " +
+			"backup must be specified, but not both")
 
 	// If a Single is specified then we'll only accept one of them to allow
-	// the caller to map the valid/invalid state for each individual
-	// Single.
-	if in.GetSingleChanBackups() != nil &&
-		len(in.GetSingleChanBackups().ChanBackups) != 1 {
-
-		return nil, fmt.Errorf("only one Single is accepted at a time")
-	}
-
-	// By default, we'll assume that both backups are valid.
-	resp := lnrpc.VerifyChanBackupResponse{
-		SinglesValid: true,
-		MultiValid:   true,
-	}
-
-	if in.GetSingleChanBackups() != nil {
-		// First, we'll convert the raw byte sliice into a type we can
-		// work with a bit better.
+	// the caller to map the valid/invalid state for each individual Single.
+	case in.GetSingleChanBackups() != nil:
 		chanBackupsProtos := in.GetSingleChanBackups().ChanBackups
+		if len(chanBackupsProtos) != 1 {
+			return nil, errors.New("only one Single is accepted " +
+				"at a time")
+		}
+
+		// First, we'll convert the raw byte slice into a type we can
+		// work with a bit better.
 		chanBackup := chanbackup.PackedSingles(
 			[][]byte{chanBackupsProtos[0].ChanBackup},
 		)
 
 		// With our PackedSingles created, we'll attempt to unpack the
-		// backup. If this fails, then we know the backup is invalid
-		// for some reason.
+		// backup. If this fails, then we know the backup is invalid for
+		// some reason.
 		_, err := chanBackup.Unpack(r.server.cc.keyRing)
-		resp.SinglesValid = err == nil
-	}
+		if err != nil {
+			return nil, fmt.Errorf("invalid single channel "+
+				"backup: %v", err)
+		}
 
-	if in.GetMultiChanBackup() != nil {
-		// Similarly, we'll convert the raw byte slice into a
-		// PackedMulti that we can easily work with.
+	case in.GetMultiChanBackup() != nil:
+		// We'll convert the raw byte slice into a PackedMulti that we
+		// can easily work with.
 		packedMultiBackup := in.GetMultiChanBackup().MultiChanBackup
 		packedMulti := chanbackup.PackedMulti(packedMultiBackup)
 
-		// We'll now attempt to unpack the Multi. If this fails, then
-		// we know it's invalid.
+		// We'll now attempt to unpack the Multi. If this fails, then we
+		// know it's invalid.
 		_, err := packedMulti.Unpack(r.server.cc.keyRing)
-		resp.MultiValid = err == nil
+		if err != nil {
+			return nil, fmt.Errorf("invalid multi channel backup: "+
+				"%v", err)
+		}
 	}
 
-	return &resp, nil
+	return &lnrpc.VerifyChanBackupResponse{}, nil
 }
 
 // createBackupSnapshot converts the passed Single backup into a snapshot which

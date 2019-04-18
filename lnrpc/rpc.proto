@@ -714,6 +714,9 @@ service Lightning {
     from the WalletUnlocker service.
     */
     rpc ExportChannelBackup(ExportChannelBackupRequest) returns (ChannelBackup) {
+        option (google.api.http) = {
+            get: "/v1/channels/backup/{chan_point.funding_txid_str}/{chan_point.output_index}"
+        };
     };
 
     /**
@@ -724,15 +727,21 @@ service Lightning {
     each channel.
     */
     rpc ExportAllChannelBackups(ChanBackupExportRequest) returns (ChanBackupSnapshot) {
+        option (google.api.http) = {
+            get: "/v1/channels/backup"
+        };
     };
 
     /**
-    VerifyChanBackup allows a caller to verify the integrity of a channel
-    backup snapshot. This method will accept both a packed Single, and also a
-    Packed multi. Two bools are returned which indicate if the passed Single
-    (if present) is valid and also if the passed Multi (if present) is valid.
+    VerifyChanBackup allows a caller to verify the integrity of a channel backup
+    snapshot. This method will accept either a packed Single or a packed Multi.
+    Specifying both will result in an error.
     */
     rpc VerifyChanBackup(ChanBackupSnapshot) returns (VerifyChanBackupResponse) {
+        option (google.api.http) = {
+            post: "/v1/channels/backup/verify"
+            body: "*"
+        };
     };
 
     /** lncli: `restorechanbackup`
@@ -742,6 +751,10 @@ service Lightning {
     new channel will be shown under listchannels, as well as pending channels.
     */
     rpc RestoreChannelBackups(RestoreChanBackupRequest) returns (RestoreBackupResponse)  {
+        option (google.api.http) = {
+            post: "/v1/channels/backup/restore"
+            body: "*"
+        };
     };
 
     /**
@@ -1243,6 +1256,26 @@ message Peer {
 
     /// Ping time to this peer
     int64 ping_time = 9 [json_name = "ping_time"];
+
+    enum SyncType {
+        /**
+        Denotes that we cannot determine the peer's current sync type.
+        */
+        UNKNOWN_SYNC = 0;
+
+        /**
+        Denotes that we are actively receiving new graph updates from the peer.
+        */
+        ACTIVE_SYNC = 1;
+
+        /**
+        Denotes that we are not receiving new graph updates from the peer.
+        */
+        PASSIVE_SYNC = 2;
+    }
+
+    // The type of sync we are currently performing with this peer.
+    SyncType sync_type = 10 [json_name = "sync_type"];
 }
 
 message ListPeersRequest {
@@ -2331,6 +2364,4 @@ message RestoreBackupResponse {}
 message ChannelBackupSubscription {}
 
 message VerifyChanBackupResponse {
-    bool singles_valid = 1 [ json_name = "singles_valid"];
-    bool multi_valid = 2 [ json_name = "multi_valid"];
 }

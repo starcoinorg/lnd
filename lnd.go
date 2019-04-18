@@ -177,29 +177,15 @@ func lndMain() error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Ensure we create TLS key and certificate if they don't exist
-	if !fileExists(cfg.TLSCertPath) && !fileExists(cfg.TLSKeyPath) {
-		if err := genCertPair(cfg.TLSCertPath, cfg.TLSKeyPath); err != nil {
-			return err
-		}
+	tlsCfg, restCreds, restProxyDest, err := getTLSConfig(cfg)
+	if err != nil {
+		return err
 	}
 
-	cert, err := tls.LoadX509KeyPair(cfg.TLSCertPath, cfg.TLSKeyPath)
-	if err != nil {
-		return err
-	}
-	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		CipherSuites: tlsCipherSuites,
-		MinVersion:   tls.VersionTLS12,
-	}
-	sCreds := credentials.NewTLS(tlsConf)
-	serverOpts := []grpc.ServerOption{grpc.Creds(sCreds)}
-	cCreds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath, "")
-	if err != nil {
-		return err
-	}
-	proxyOpts := []grpc.DialOption{grpc.WithTransportCredentials(cCreds)}
+	serverCreds := credentials.NewTLS(tlsCfg)
+	serverOpts := []grpc.ServerOption{grpc.Creds(serverCreds)}
+
+	restDialOpts := []grpc.DialOption{grpc.WithTransportCredentials(*restCreds)}
 
 	// Before starting the wallet, we'll create and start our Neutrino
 	// light client instance, if enabled, in order to allow it to sync
@@ -237,7 +223,7 @@ func lndMain() error {
 	if !cfg.NoSeedBackup {
 		params, err := waitForWalletPassword(
 			cfg.RPCListeners, cfg.RESTListeners, serverOpts,
-			proxyOpts, tlsConf,
+			restDialOpts, restProxyDest, tlsCfg,
 		)
 		if err != nil {
 			return err
@@ -292,7 +278,7 @@ func lndMain() error {
 	// With the information parsed from the configuration, create valid
 	// instances of the pertinent interfaces required to operate the
 	// Lightning Network Daemon.
-	activeChainControl, chainCleanUp, err := newChainControlFromConfig(
+	activeChainControl, err := newChainControlFromConfig(
 		cfg, chanDB, privateWalletPw, publicWalletPw,
 		walletInitParams.Birthday, walletInitParams.RecoveryWindow,
 		walletInitParams.Wallet, neutrinoCS,
@@ -300,9 +286,6 @@ func lndMain() error {
 	if err != nil {
 		fmt.Printf("unable to create chain control: %v\n", err)
 		return err
-	}
-	if chainCleanUp != nil {
-		defer chainCleanUp()
 	}
 
 	// Finally before we start the server, we'll register the "holy
@@ -365,7 +348,8 @@ func lndMain() error {
 	ltndLog.Info(proxyOpts)
 	rpcServer, err := newRPCServer(
 		server, macaroonService, cfg.SubRPCServers, serverOpts,
-		proxyOpts, atplManager, server.invoices, tlsConf,
+		restDialOpts, restProxyDest, atplManager, server.invoices,
+		tlsCfg,
 	)
 	if err != nil {
 		srvrLog.Errorf("unable to start RPC server: %v", err)
@@ -438,6 +422,51 @@ func lndMain() error {
 	// the interrupt handler.
 	<-signal.ShutdownChannel()
 	return nil
+}
+
+// getTLSConfig returns a TLS configuration for the gRPC server and credentials
+// and a proxy destination for the REST reverse proxy.
+func getTLSConfig(cfg *config) (*tls.Config, *credentials.TransportCredentials,
+	string, error) {
+
+	// Ensure we create TLS key and certificate if they don't exist
+	if !fileExists(cfg.TLSCertPath) && !fileExists(cfg.TLSKeyPath) {
+		err := genCertPair(cfg.TLSCertPath, cfg.TLSKeyPath)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	}
+
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCertPath, cfg.TLSKeyPath)
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		CipherSuites: tlsCipherSuites,
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	restCreds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath, "")
+	if err != nil {
+		return nil, nil, "", err
+	}
+
+	restProxyDest := cfg.RPCListeners[0].String()
+	switch {
+	case strings.Contains(restProxyDest, "0.0.0.0"):
+		restProxyDest = strings.Replace(
+			restProxyDest, "0.0.0.0", "127.0.0.1", 1,
+		)
+
+	case strings.Contains(restProxyDest, "[::]"):
+		restProxyDest = strings.Replace(
+			restProxyDest, "[::]", "[::1]", 1,
+		)
+	}
+
+	return tlsCfg, &restCreds, restProxyDest, nil
 }
 
 func main() {
@@ -690,8 +719,8 @@ type WalletUnlockParams struct {
 // WalletUnlocker server, and block until a password is provided by
 // the user to this RPC server.
 func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
-	serverOpts []grpc.ServerOption, proxyOpts []grpc.DialOption,
-	tlsConf *tls.Config) (*WalletUnlockParams, error) {
+	serverOpts []grpc.ServerOption, restDialOpts []grpc.DialOption,
+	restProxyDest string, tlsConf *tls.Config) (*WalletUnlockParams, error) {
 
 	// Set up a new PasswordService, which will listen for passwords
 	// provided over RPC.
@@ -751,7 +780,7 @@ func waitForWalletPassword(grpcEndpoints, restEndpoints []net.Addr,
 	mux := proxy.NewServeMux()
 
 	err := lnrpc.RegisterWalletUnlockerHandlerFromEndpoint(
-		ctx, mux, grpcEndpoints[0].String(), proxyOpts,
+		ctx, mux, restProxyDest, restDialOpts,
 	)
 	if err != nil {
 		return nil, err
