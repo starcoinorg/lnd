@@ -616,6 +616,11 @@ func (r *rpcServer) Start() error {
 	if err != nil {
 		return err
 	}
+	err = invoicesrpc.RegisterInvoicesHandlerFromEndpoint(context.Background(),mux,r.restProxyDest,
+		r.restDialOpts)
+	if err != nil {
+		return err
+	}
 	for _, restEndpoint := range cfg.RESTListeners {
 		lis, err := lncfg.TLSListenOnAddress(restEndpoint, r.tlsCfg)
 		if err != nil {
