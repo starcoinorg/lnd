@@ -4166,7 +4166,7 @@ func (r *rpcServer) SubscribeChannelGraph(req *lnrpc.GraphTopologySubscription,
 
 		// A new update has been sent by the channel router, we'll
 		// marshal it into the form expected by the gRPC client, then
-		// send it off.
+		// send it off.a
 		case topChange, ok := <-client.TopologyChanges:
 			// If the second value from the channel read is nil,
 			// then this means that the channel router is exiting
