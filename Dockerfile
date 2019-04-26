@@ -9,9 +9,9 @@ RUN apk add --no-cache --update alpine-sdk \
     git \
     make \
     gcc \
-&&  git clone https://github.com/lightningnetwork/lnd /go/src/github.com/lightningnetwork/lnd \
-&&  cd /go/src/github.com/lightningnetwork/lnd \
-&&  make \
+    &&  git clone https://github.com/starcoinorg/lnd /go/src/github.com/starcoinorg/lnd \
+    &&  cd /go/src/github.com/starcoinorg/lnd \
+    &&  make tags="invoicesrpc"\
 &&  make install
 
 # Start a new, final image.
