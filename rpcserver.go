@@ -3418,20 +3418,34 @@ func (r *rpcServer) AddInvoice(ctx context.Context,
 		ChanDB:            r.server.chanDB,
 	}
 
-	rhash,err:=lntypes.MakeHash(invoice.RHash)
-	if err != nil {
-		return nil, err
-	}
-	addInvoiceData := &invoicesrpc.AddInvoiceData{
-		Memo:            invoice.Memo,
-		Receipt:         invoice.Receipt,
-		Value:           btcutil.Amount(invoice.Value),
-		DescriptionHash: invoice.DescriptionHash,
-		Expiry:          invoice.Expiry,
-		FallbackAddr:    invoice.FallbackAddr,
-		CltvExpiry:      invoice.CltvExpiry,
-		Private:         invoice.Private,
-		Hash: &rhash,
+	var addInvoiceData *invoicesrpc.AddInvoiceData
+	if(invoice.RHash!=nil){
+		rhash,err:=lntypes.MakeHash(invoice.RHash)
+		if err != nil {
+			return nil, err
+		}
+		addInvoiceData = &invoicesrpc.AddInvoiceData{
+			Memo:            invoice.Memo,
+			Receipt:         invoice.Receipt,
+			Value:           btcutil.Amount(invoice.Value),
+			DescriptionHash: invoice.DescriptionHash,
+			Expiry:          invoice.Expiry,
+			FallbackAddr:    invoice.FallbackAddr,
+			CltvExpiry:      invoice.CltvExpiry,
+			Private:         invoice.Private,
+			Hash: &rhash,
+		}
+	}else {
+		addInvoiceData = &invoicesrpc.AddInvoiceData{
+			Memo:            invoice.Memo,
+			Receipt:         invoice.Receipt,
+			Value:           btcutil.Amount(invoice.Value),
+			DescriptionHash: invoice.DescriptionHash,
+			Expiry:          invoice.Expiry,
+			FallbackAddr:    invoice.FallbackAddr,
+			CltvExpiry:      invoice.CltvExpiry,
+			Private:         invoice.Private,
+		}
 	}
 
 	if invoice.RPreimage != nil {
