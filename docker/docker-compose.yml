@@ -5,7 +5,7 @@ services:
     # btccli. The environment variables default values determined on stage of
     # container start within starting script.
     btc:
-      image: btcd
+      image: starcoin/btcd
       build:
         context: btcd/
       volumes:
@@ -63,7 +63,7 @@ services:
         entrypoint: ["./start-ltcctl.sh"]
 
     lnd:
-        image: lnd
+        image: starcoin/lnd
         build:
           context: ../
           dockerfile: docker/lnd/Dockerfile
