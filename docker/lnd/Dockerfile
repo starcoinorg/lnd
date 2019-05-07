@@ -14,7 +14,7 @@ RUN apk add --no-cache --update alpine-sdk \
     git \
     make \
 &&  cd /go/src/github.com/lightningnetwork/lnd \
-&&  make \
+&&  make tags="invoicesrpc" \
 &&  make install
 
 # Start a new, final image to reduce size.
