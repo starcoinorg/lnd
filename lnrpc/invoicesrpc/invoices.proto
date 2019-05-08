@@ -22,7 +22,12 @@ service Invoices {
     canceled, this call will succeed. If the invoice is already settled, it will
     fail.
     */
-    rpc CancelInvoice(CancelInvoiceMsg) returns (CancelInvoiceResp);
+    rpc CancelInvoice(CancelInvoiceMsg) returns (CancelInvoiceResp){
+            option (google.api.http) = {
+                post: "/v1/invoice/cancel"
+                body: "*"
+        };
+    }
 
     /**
     AddHoldInvoice creates a hold invoice. It ties the invoice to the hash
