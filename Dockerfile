@@ -12,7 +12,7 @@ RUN apk add --no-cache --update alpine-sdk \
     &&  git clone https://github.com/starcoinorg/lnd /go/src/github.com/starcoinorg/lnd \
     &&  cd /go/src/github.com/starcoinorg/lnd \
     &&  make tags="invoicesrpc"\
-&&  make install
+&&  make install tags="invoicesrpc"
 
 # Start a new, final image.
 FROM alpine as final
